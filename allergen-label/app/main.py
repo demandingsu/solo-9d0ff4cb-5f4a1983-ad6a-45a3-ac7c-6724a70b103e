@@ -4,11 +4,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .service import ServiceError, get_state, upload_declarations, upload_relations
+from .service import (
+    ServiceError,
+    get_state,
+    run_investigation,
+    upload_declarations,
+    upload_relations,
+)
 from .storage import Storage
 
 DB_PATH = os.environ.get("ALLERGEN_DB", "/data/allergen.db")
@@ -55,6 +61,22 @@ async def api_upload_relations(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="上传文件为空")
     try:
         return upload_relations(storage, data)
+    except ServiceError as exc:
+        raise exc
+
+
+@app.post("/api/investigations")
+async def api_investigate(
+    allergen: str = Form(""), file: UploadFile = File(...)
+):
+    """指定过敏原 + 抽检结果 CSV，在已提交快照上排查漏报原料（只读建议）。"""
+    if not allergen.strip():
+        raise HTTPException(status_code=400, detail="请指定要排查的过敏原")
+    data = await file.read()
+    if not data.strip():
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    try:
+        return run_investigation(storage, allergen, data)
     except ServiceError as exc:
         raise exc
 

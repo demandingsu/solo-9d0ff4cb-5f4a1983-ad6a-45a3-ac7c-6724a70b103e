@@ -19,6 +19,7 @@ from app.parse import (  # noqa: E402
     ParseError,
     parse_declarations,
     parse_relations,
+    parse_sampling,
 )
 from app.storage import Storage  # noqa: E402
 
@@ -208,6 +209,218 @@ class ServiceRuleTests(unittest.TestCase):
         )
 
 
+class SamplingParseTests(unittest.TestCase):
+    def test_results_normalized(self):
+        batch = parse_sampling(
+            "成品号,抽检结果\nFG1,阳性\nFG2,negative\nFG3,+\nFG4,阴\n".encode()
+        )
+        self.assertEqual(
+            batch.by_finished_good,
+            {"FG1": "positive", "FG2": "negative", "FG3": "positive", "FG4": "negative"},
+        )
+
+    def test_invalid_result_rejected(self):
+        with self.assertRaises(ParseError):
+            parse_sampling("成品号,抽检结果\nFG1,疑似\n".encode())
+
+    def test_same_finished_good_conflicting_results_rejected(self):
+        with self.assertRaises(ParseError) as ctx:
+            parse_sampling("成品号,抽检结果\nFG1,阳性\nFG1,阴性\n".encode())
+        self.assertIn("不一致", ctx.exception.details[0])
+
+    def test_bad_headers_rejected(self):
+        with self.assertRaises(ParseError):
+            parse_sampling("成品,结果\nFG1,阳性\n".encode())
+
+
+class InvestigationTests(unittest.TestCase):
+    """抽检排查：基于已提交快照，只读给出建议。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.storage = Storage(Path(self.tmp.name) / "t.db")
+        service.upload_declarations(
+            self.storage, read_sample("investigation_declarations.csv")
+        )
+        service.upload_relations(
+            self.storage, read_sample("investigation_relations.csv")
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, name, allergen="花生"):
+        return service.run_investigation(
+            self.storage, allergen, read_sample(name)
+        )["result"]
+
+    def test_explained_positive_not_blamed_and_tied_minimum_listed(self):
+        result = self._run("sampling.csv")
+        self.assertEqual(result["status"], "solved")
+        # FG10 由已声明 M10（花生）解释，不进入待解释阳性
+        self.assertEqual(result["unexplained_positives"], ["FG11", "FG12"])
+        self.assertEqual(
+            [x["finished_good_id"] for x in result["explained_positives"]],
+            ["FG10"],
+        )
+        # M05 出现在有效阴性 FG13，被排除；M03/M04 都覆盖 FG11+FG12，并列最小
+        excluded = {c["material_id"]: c["excluded"] for c in result["candidates"]}
+        self.assertTrue(excluded["M05"])
+        self.assertFalse(excluded["M03"])
+        self.assertEqual(
+            [s["ingredients"] for s in result["solutions"]], [["M03"], ["M04"]]
+        )
+        self.assertEqual(result["minimum_size"], 1)
+        self.assertEqual(result["solution_count"], 2)
+
+    def test_conflict_negative_not_used_as_exclusion(self):
+        # FG14 阴性但已知声明含花生（M10）-> 冲突，不得用于排除 M03
+        result = self._run("sampling.csv")
+        self.assertEqual(
+            [c["finished_good_id"] for c in result["conflicts"]], ["FG14"]
+        )
+        self.assertNotIn("FG14", result["negative_evidence"])
+        self.assertFalse(
+            next(c for c in result["candidates"] if c["material_id"] == "M03")["excluded"]
+        )
+        # 同样含 M03 的 FG14 若按其阴性排除 M03，则组合会消失；此处仍应有解
+        self.assertTrue(result["solutions"])
+
+    def test_impossible_explains_reason(self):
+        result = self._run("sampling_impossible.csv")
+        self.assertEqual(result["status"], "impossible")
+        self.assertEqual(result["solutions"], [])
+        self.assertGreaterEqual(len(result["reasons"]), 2)
+        joined = " ".join(result["reasons"])
+        self.assertIn("FG11", joined)  # 候选全被阴性排除
+        self.assertIn("FG15", joined)  # 无缺声明叶子，问题不在原料
+        self.assertIn("FG16", joined)
+
+    def test_all_positives_explained_needs_no_blame(self):
+        result = self._run("sampling_no_blame.csv")
+        self.assertEqual(result["status"], "no_blame")
+        self.assertEqual(result["solutions"], [])
+
+    def test_no_positive(self):
+        result = self._run("sampling_no_positive.csv")
+        self.assertEqual(result["status"], "no_positive")
+
+    def test_unknown_finished_good_rejected(self):
+        with self.assertRaises(service.ServiceError) as ctx:
+            service.run_investigation(
+                self.storage,
+                "花生",
+                "成品号,抽检结果\nFG99,阳性\n".encode(),
+            )
+        self.assertIn("FG99", " ".join(ctx.exception.details))
+
+    def test_limits_rejected(self):
+        # 20 款成品上限
+        rows = "\n".join(f"FG{i},阴性" for i in range(21))
+        with self.assertRaises(service.ServiceError) as ctx:
+            self._run_raw("成品号,抽检结果\n" + rows + "\n")
+        self.assertIn("20", ctx.exception.message)
+
+        # 12 个候选原料上限：13 个缺声明叶子分别挂到 13 款成品
+        rel = "父项,子项\n" + "\n".join(f"FGX{i},MX{i}" for i in range(13))
+        service.upload_relations(self.storage, rel.encode())
+        rows = "\n".join(f"FGX{i},阳性" for i in range(13))
+        with self.assertRaises(service.ServiceError) as ctx:
+            self._run_raw("成品号,抽检结果\n" + rows + "\n")
+        self.assertIn("12", ctx.exception.message)
+
+    def test_does_not_modify_declarations_or_labels(self):
+        before = service.get_state(self.storage)
+        self._run("sampling.csv")
+        after = service.get_state(self.storage)
+        self.assertEqual(before["state_version"], after["state_version"])
+        self.assertEqual(before["declarations"], after["declarations"])
+        self.assertEqual(before["finished_goods"], after["finished_goods"])
+
+    def test_result_marked_stale_after_declaration_update(self):
+        self._run("sampling.csv")
+        state = service.get_state(self.storage)
+        self.assertFalse(state["investigation"]["stale"])
+        self.assertEqual(
+            state["investigation"]["analyzed_state_version"], state["state_version"]
+        )
+
+        service.upload_declarations(
+            self.storage, read_sample("declarations_corrected.csv")
+        )
+        state = service.get_state(self.storage)
+        self.assertTrue(state["investigation"]["stale"])
+        self.assertIn("已过期", state["investigation"]["stale_message"])
+        # 旧结果仍可追溯，但记录其分析版本
+        self.assertEqual(
+            state["investigation"]["analyzed_state_version"],
+            state["state_version"] - 1,
+        )
+
+    def test_result_marked_stale_after_relation_update(self):
+        self._run("sampling.csv")
+        service.upload_relations(
+            self.storage, read_sample("investigation_relations.csv")
+        )
+        state = service.get_state(self.storage)
+        self.assertTrue(state["investigation"]["stale"])
+
+    def _run_raw(self, data):
+        return service.run_investigation(self.storage, "花生", data.encode())
+
+
+class InvestigationCoverTests(unittest.TestCase):
+    """组合求解：最小规模 > 1 时仍列出全部并列最小组合。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.storage = Storage(Path(self.tmp.name) / "t.db")
+        service.upload_declarations(
+            self.storage,
+            "原料号,修订号,过敏原\nD1,1,花生\n".encode(),
+        )
+        # FG1 -> A,B；FG2 -> C,D；FG3 -> D1（已声明，阳性由声明解释）
+        service.upload_relations(
+            self.storage,
+            (
+                "父项,子项\n"
+                "FG1,A\nFG1,B\n"
+                "FG2,C\nFG2,D\n"
+                "FG3,D1\n"
+            ).encode(),
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_all_tied_minimum_pairs_listed(self):
+        result = service.run_investigation(
+            self.storage,
+            "花生",
+            "成品号,抽检结果\nFG1,阳性\nFG2,阳性\nFG3,阳性\n".encode(),
+        )["result"]
+        self.assertEqual(result["status"], "solved")
+        self.assertEqual(result["minimum_size"], 2)
+        self.assertEqual(result["solution_count"], 4)
+        self.assertEqual(
+            sorted(tuple(s["ingredients"]) for s in result["solutions"]),
+            [("A", "C"), ("A", "D"), ("B", "C"), ("B", "D")],
+        )
+        # 每个组合都必须覆盖两个待解释阳性，且覆盖关系可追溯
+        for solution in result["solutions"]:
+            self.assertEqual(set(solution["covers"]), {"FG1", "FG2"})
+            self.assertTrue(all(solution["covers"].values()))
+
+    def test_choice_explained_by_declaration_is_ignored(self):
+        result = service.run_investigation(
+            self.storage,
+            "花生",
+            "成品号,抽检结果\nFG3,阳性\n".encode(),
+        )["result"]
+        self.assertEqual(result["status"], "no_blame")
+        self.assertEqual(result["solutions"], [])
+
+
 class ApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -312,6 +525,56 @@ class ApiTests(unittest.TestCase):
         r = self.client.get("/")
         self.assertEqual(r.status_code, 200)
         self.assertIn("过敏原", r.text)
+
+    def test_07_investigation_api_and_stale_flag(self):
+        # 先保证有声明/配方
+        self._upload("declarations", "investigation_declarations.csv")
+        self._upload("relations", "investigation_relations.csv")
+        r = self.client.post(
+            "/api/investigations",
+            data={"allergen": "花生"},
+            files={
+                "file": (
+                    "sampling.csv",
+                    read_sample("sampling.csv"),
+                    "text/csv",
+                )
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["result"]["status"], "solved")
+        self.assertEqual(body["state_version"], body["analyzed_state_version"])
+
+        state = self.client.get("/api/state").json()
+        self.assertFalse(state["investigation"]["stale"])
+
+        # 更新声明 -> 页面可据此标记旧结果过期
+        self._upload("declarations", "declarations_corrected.csv")
+        state = self.client.get("/api/state").json()
+        self.assertTrue(state["investigation"]["stale"])
+
+    def test_08_investigation_api_errors(self):
+        r = self.client.post(
+            "/api/investigations",
+            data={"allergen": ""},
+            files={"file": ("s.csv", b"x", "text/csv")},
+        )
+        self.assertEqual(r.status_code, 400)
+
+        r = self.client.post(
+            "/api/investigations",
+            data={"allergen": "花生"},
+            files={
+                "file": (
+                    "bad.csv",
+                    "成品号,抽检结果\nFG99,阳性\n".encode(),
+                    "text/csv",
+                )
+            },
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("FG99", " ".join(r.json()["details"]))
 
 
 if __name__ == "__main__":

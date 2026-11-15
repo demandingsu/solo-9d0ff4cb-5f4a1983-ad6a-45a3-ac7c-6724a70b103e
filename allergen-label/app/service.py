@@ -1,13 +1,16 @@
-"""业务编排：上传校验 + 基于已提交快照的标注推导。"""
+"""业务编排：上传校验 + 基于已提交快照的标注推导 + 抽检排查。"""
 from __future__ import annotations
 
-from . import derive, graph
+import json
+
+from . import derive, graph, investigate
 from .parse import (
     DeclarationBatch,
     ParseError,
     RelationBatch,
     parse_declarations,
     parse_relations,
+    parse_sampling,
 )
 from .storage import Storage
 
@@ -88,7 +91,6 @@ def get_state(storage: Storage) -> dict:
     edges = state["edges"]
     all_nodes = state["all_nodes"]
     declarations = state["declarations"]
-
     roots = graph.finished_goods(edges)
     memo = derive.derive_all(edges, all_nodes, declarations, roots=roots)
 
@@ -113,6 +115,28 @@ def get_state(storage: Storage) -> dict:
         for parent, kids in sorted(edges.items())
         for child in kids
     ]
+
+    last = state["last_investigation"]
+    investigation_view = None
+    if last is not None:
+        try:
+            payload = json.loads(last["payload"])
+        except (TypeError, ValueError):
+            payload = None
+        if payload is not None:
+            investigation_view = {
+                "id": last["id"],
+                "created_at": last["created_at"],
+                "analyzed_state_version": last["state_version"],
+                "stale": last["state_version"] != state["version"],
+                "stale_message": (
+                    "配方或声明已更新，该排查结果已过期，请重新排查"
+                    if last["state_version"] != state["version"]
+                    else ""
+                ),
+                "result": payload,
+            }
+
     return {
         "state_version": state["version"],
         "counts": {
@@ -126,4 +150,46 @@ def get_state(storage: Storage) -> dict:
         "relations": relation_view,
         "finished_goods": finished,
         "snapshots": state["snapshots"],
+        "investigation": investigation_view,
+    }
+
+
+def run_investigation(
+    storage: Storage, allergen: str, data: bytes
+) -> dict:
+    """校验抽检 CSV，在读取到的同一已提交快照上排查并保存结果。
+
+    排查只读快照，绝不修改声明/配方；保存结果不改变 state_version。
+    """
+    allergen = (allergen or "").strip()
+    try:
+        batch = parse_sampling(data)
+    except ParseError as exc:
+        raise ServiceError(exc.message, exc.details) from exc
+
+    state = storage.read_state()
+    try:
+        result = investigate.analyze(
+            edges=state["edges"],
+            all_nodes=state["all_nodes"],
+            declarations=state["declarations"],
+            sampling=batch.by_finished_good,
+            allergen=allergen,
+        )
+    except investigate.InvestigationError as exc:
+        raise ServiceError(exc.message, exc.details) from exc
+
+    saved = storage.save_investigation(
+        allergen=allergen,
+        state_version=state["version"],
+        payload=json.dumps(result, ensure_ascii=False),
+    )
+    return {
+        "accepted": True,
+        "investigation_id": saved["id"],
+        "created_at": saved["created_at"],
+        "analyzed_state_version": state["version"],
+        "state_version": state["version"],
+        "stale": False,
+        "result": result,
     }

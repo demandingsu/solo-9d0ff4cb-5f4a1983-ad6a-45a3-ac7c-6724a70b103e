@@ -11,8 +11,23 @@ from dataclasses import dataclass, field
 
 DECLARATION_HEADERS = ["原料号", "修订号", "过敏原"]
 RELATION_HEADERS = ["父项", "子项"]
+SAMPLING_HEADERS = ["成品号", "抽检结果"]
 # 同一单元格内多种过敏原的分隔符
 _ALLERGEN_SPLIT = "，,；;、"
+
+# 抽检结果只接受阳性/阴性两种语义，兼容常见中英文写法
+_SAMPLING_RESULTS = {
+    "阳性": "positive",
+    "阳": "positive",
+    "positive": "positive",
+    "pos": "positive",
+    "+": "positive",
+    "阴性": "negative",
+    "阴": "negative",
+    "negative": "negative",
+    "neg": "negative",
+    "-": "negative",
+}
 
 
 class ParseError(ValueError):
@@ -46,6 +61,20 @@ class RelationBatch:
     edges: dict[str, list[str]]
     all_nodes: set[str]
     edge_count: int
+
+
+@dataclass(frozen=True)
+class SamplingRow:
+    finished_good_id: str
+    result: str  # "positive" | "negative"
+    row_number: int
+
+
+@dataclass
+class SamplingBatch:
+    rows: list[SamplingRow]
+    # 成品号 -> 阳性/阴性结果（同一成品重复抽检必须结论一致）
+    by_finished_good: dict[str, str] = field(default_factory=dict)
 
 
 def decode_bytes(data: bytes) -> str:
@@ -202,3 +231,63 @@ def parse_relations(data: bytes) -> RelationBatch:
         raise ParseError("配方关系 CSV 没有任何有效数据行")
 
     return RelationBatch(edges=edges, all_nodes=all_nodes, edge_count=edge_count)
+
+
+def parse_sampling(data: bytes) -> SamplingBatch:
+    """解析成品抽检结果 CSV（列：成品号、抽检结果）。
+
+    抽检结果只接受阳性/阴性（兼容 positive/negative/pos/neg/+/-）。
+    同一成品号重复出现时，结果必须一致，否则整份拒收并给出冲突行号。
+    """
+    text = decode_bytes(data)
+    reader = csv.DictReader(io.StringIO(text))
+    _check_headers(reader.fieldnames, SAMPLING_HEADERS)
+
+    errors: list[str] = []
+    rows: list[SamplingRow] = []
+    # finished_good -> (row_number, result)
+    seen: dict[str, tuple[int, str]] = {}
+
+    for row_index, raw_row in enumerate(reader, start=2):
+        if raw_row is None:
+            continue
+        if not any((v or "").strip() for v in raw_row.values()):
+            continue
+        finished_good = (raw_row.get("成品号") or "").strip()
+        result_text = (raw_row.get("抽检结果") or "").strip()
+
+        if not finished_good:
+            errors.append(f"第 {row_index} 行：成品号为空")
+            continue
+        result = _SAMPLING_RESULTS.get(result_text.lower())
+        if result is None:
+            errors.append(
+                f"第 {row_index} 行：抽检结果必须为阳性或阴性，实际为 {result_text!r}"
+            )
+            continue
+        if finished_good in seen:
+            first_row, first_result = seen[finished_good]
+            if first_result != result:
+                errors.append(
+                    f"第 {row_index} 行：成品 {finished_good} 与第 {first_row} 行"
+                    "抽检结论不一致（同一成品不允许同时为阳性与阴性）"
+                )
+            continue  # 完全重复的结论去重
+        seen[finished_good] = (row_index, result)
+        rows.append(
+            SamplingRow(
+                finished_good_id=finished_good,
+                result=result,
+                row_number=row_index,
+            )
+        )
+
+    if errors:
+        raise ParseError("抽检结果校验失败", errors)
+    if not rows:
+        raise ParseError("抽检结果 CSV 没有任何有效数据行")
+
+    return SamplingBatch(
+        rows=rows,
+        by_finished_good={r.finished_good_id: r.result for r in rows},
+    )

@@ -53,12 +53,36 @@
   .src-line { font-size:12px; margin:2px 0; }
   .snap { font-size:12px; color:#5b6572; }
   .empty { padding:26px; text-align:center; color:#7a8593; }
+  .badge.conflict { background:#fdecea; color:var(--red); }
+  .badge.explained { background:#eaf1fe; color:#1f4fb0; }
+  .badge.excluded { background:#eef1f5; color:#57606a; }
+  .badge.unexplained { background:#fff4e5; color:var(--amber); }
+  .stale-banner { margin:0 0 12px; padding:12px 14px; border-radius:8px; font-size:13px;
+                  background:#fff4e5; color:var(--amber); border:1px solid #f0c78a; }
+  .stale-banner strong { display:block; margin-bottom:4px; }
+  .stale-content { opacity:.55; }
+  .invest-card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+                 padding:16px; margin-bottom:14px; }
+  .invest-card h3 { margin:0 0 10px; font-size:14px; }
+  .solutions { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
+  .solution { border:1px solid var(--line); border-radius:9px; padding:12px;
+              background:#fbfcfe; }
+  .solution .sol-head { font-size:13px; font-weight:600; margin-bottom:8px; }
+  .sol-line { font-size:12px; margin:3px 0; }
+  .reason-list { margin:0; padding-left:20px; font-size:13px; color:var(--red); line-height:1.8; }
+  .invest-empty { color:#7a8593; font-size:13px; }
+  .allergen-input { font-size:13px; padding:7px 9px; border:1px solid var(--line);
+                    border-radius:6px; width:170px; }
+  .status-badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; }
+  .status-badge.solved { background:#e6f4ea; color:var(--green); }
+  .status-badge.impossible { background:#fdecea; color:var(--red); }
+  .status-badge.no_blame, .status-badge.no_positive { background:#eaf1fe; color:#1f4fb0; }
 </style>
 </head>
 <body>
 <header>
   <h1>食品厂过敏原标签核对系统</h1>
-  <p>上传原料声明与配方关系（整版替换），按每种原料最高修订推导每款成品应标注的过敏原及来源；缺声明标注“待核”，配方成环整份拒收。</p>
+  <p>上传原料声明与配方关系（整版替换），按每种原料最高修订推导每款成品应标注的过敏原及来源；缺声明标注“待核”，配方成环整份拒收。支持按指定过敏原上传成品抽检结果，排查可能漏报的缺声明原料（只读建议，不改声明或标签）。</p>
 </header>
 <main>
   <section class="cards">
@@ -131,6 +155,29 @@
       <tbody id="relBody"></tbody>
     </table>
   </section>
+
+  <section style="margin-top:26px">
+    <div class="statusbar">
+      <strong>④ 成品抽检排查（漏报过敏原的缺声明原料）</strong>
+      <span class="snap">基于当前已提交版本 v<span id="investVer"></span> 的配方与声明</span>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <div class="upload-row">
+        <label for="allergenInput" class="hint" style="margin:0">过敏原</label>
+        <input id="allergenInput" class="allergen-input" list="allergenOptions"
+               placeholder="如 花生" autocomplete="off">
+        <datalist id="allergenOptions"></datalist>
+        <input type="file" id="samplingFile" accept=".csv,text/csv">
+        <button onclick="runInvestigation()">开始排查</button>
+        <button class="secondary" onclick="loadState()">刷新当前版本</button>
+      </div>
+      <div class="hint">抽检结果 CSV 列：成品号, 抽检结果（阳性 / 阴性）。<br>
+        只做只读分析并给出建议，不会修改任何声明或标签；单次最多 12 个候选原料、20 款成品。</div>
+      <div id="investBanner" class="banner"></div>
+    </div>
+    <div id="investStale"></div>
+    <div id="investOutput"></div>
+  </section>
 </main>
 
 <script>
@@ -175,12 +222,15 @@ async function upload(kind) {
 }
 
 let cached = null;
+let latestInvestigation = null;
 async function loadState() {
   const resp = await fetch("/api/state");
   cached = await resp.json();
   lastVersion = cached.state_version;
+  latestInvestigation = cached.investigation;
   renderStatus();
   render();
+  renderInvestigation();
 }
 
 function renderStatus() {
@@ -205,6 +255,7 @@ function render() {
   renderFinished();
   renderDeclarations();
   renderRelations();
+  renderInvestigationMeta();
 }
 
 function renderFinished() {
@@ -286,6 +337,152 @@ function sourceDetails(r) {
     .map(([a, srcs]) => `<div class="src-line">${esc(a)} ← ${srcs.map(esc).join("、")}</div>`)
     .join("");
   return `<details><summary>查看来源原料（${entries.length} 种过敏原）</summary>${lines}</details>`;
+}
+
+/* ---------------- ④ 成品抽检排查 ---------------- */
+
+function renderInvestigationMeta() {
+  if (!cached) return;
+  document.getElementById("investVer").textContent = cached.state_version;
+  const names = new Set();
+  cached.declarations.forEach(d => d.allergens.forEach(a => names.add(a)));
+  document.getElementById("allergenOptions").innerHTML =
+    [...names].sort((a,b)=>a.localeCompare(b,"zh"))
+      .map(n => `<option value="${esc(n)}"></option>`).join("");
+}
+
+async function runInvestigation() {
+  const allergen = document.getElementById("allergenInput").value.trim();
+  const input = document.getElementById("samplingFile");
+  const banner = document.getElementById("investBanner");
+  if (!allergen) { showBanner("investBanner", "err", "请先指定要排查的过敏原"); return; }
+  if (!input.files.length) { showBanner("investBanner", "err", "请先选择抽检结果 CSV"); return; }
+  const fd = new FormData();
+  fd.append("allergen", allergen);
+  fd.append("file", input.files[0]);
+  showBanner("investBanner", "ok", "排查计算中…");
+  try {
+    const resp = await fetch("/api/investigations", { method: "POST", body: fd });
+    const body = await resp.json();
+    if (!resp.ok) {
+      const detail = body.details && body.details.length ? "\n" + body.details.join("\n") : "";
+      showBanner("investBanner", "err", "✗ " + (body.error || body.detail || "排查失败") + detail);
+      return;
+    }
+    input.value = "";
+    const r = body.result;
+    showBanner("investBanner", "ok",
+      `✓ 已完成排查（${r.allergen}）：${r.summary}。结果基于 v${body.analyzed_state_version}。`);
+    await loadState();
+  } catch (e) {
+    showBanner("investBanner", "err", "✗ 网络错误：" + e);
+  }
+}
+
+function renderInvestigation() {
+  const staleBox = document.getElementById("investStale");
+  const out = document.getElementById("investOutput");
+  const inv = latestInvestigation;
+  if (!inv) {
+    staleBox.innerHTML = "";
+    out.innerHTML = `<div class="card invest-empty">尚无排查结果：指定过敏原并上传抽检结果 CSV 后开始排查。</div>`;
+    return;
+  }
+  if (inv.stale) {
+    staleBox.innerHTML = `<div class="stale-banner"><strong>⚠ 旧排查结果已过期</strong>
+      该结果基于 v${inv.analyzed_state_version}，当前已提交版本为 v${cached.state_version}；
+      配方或声明已更新，请重新排查后再据以判断。以下内容仅供追溯，不再作为当前结论。</div>`;
+  } else {
+    staleBox.innerHTML = "";
+  }
+  const r = inv.result;
+  const staleCls = inv.stale ? "stale-content" : "";
+
+  const samplingRows = r.sampling.map(s => {
+    const cls = s.classification === "conflict_negative" ? "conflict"
+      : s.classification === "explained_positive" ? "explained"
+      : s.classification === "unexplained_positive" ? "unexplained"
+      : s.classification === "evidence_negative" ? "excluded" : "";
+    const detail = s.classification === "explained_positive"
+      ? `声明来源：${s.declared_sources.map(esc).join("、") || "—"}`
+      : s.classification === "conflict_negative"
+        ? `声明来源：${s.declared_sources.map(esc).join("、") || "—"}（该阴性不作排除证据）`
+        : s.missing_leaves.length
+          ? `缺声明叶子：${s.missing_leaves.map(esc).join("、")}`
+          : `<span class="muted">该成品配方内无缺声明叶子原料</span>`;
+    return `<tr><td><strong>${esc(s.finished_good_id)}</strong></td>
+      <td>${s.result === "positive" ? "阳性" : "阴性"}</td>
+      <td><span class="badge ${cls}">${esc(s.classification_text)}</span></td>
+      <td>${detail}</td></tr>`;
+  }).join("");
+
+  let conclusion;
+  if (r.status === "solved") {
+    const cards = r.solutions.map((sol, i) => {
+      const coverLines = Object.entries(sol.covers)
+        .map(([fg, mats]) => `<div class="sol-line">覆盖 ${esc(fg)} ← ${mats.map(esc).join("、")}</div>`)
+        .join("");
+      return `<div class="solution">
+        <div class="sol-head">组合 ${i + 1}（${sol.ingredients.length} 种）</div>
+        <div class="sol-line">${sol.ingredients.map(m =>
+          `<span class="allergen-tag">${esc(m)}</span>`).join("")}</div>
+        ${coverLines}
+      </div>`;
+    }).join("");
+    conclusion = `<div class="invest-card">
+      <h3>并列最小组合（共 ${r.solution_count} 个，每个 ${r.minimum_size} 种缺声明叶子原料）</h3>
+      <div class="solutions">${cards}</div>
+      <div class="hint">组合中的原料同时覆盖全部待解释阳性成品，且不出现在任何有效阴性成品中；仅为排查建议，未修改任何声明或标签。</div>
+    </div>`;
+  } else if (r.status === "impossible") {
+    conclusion = `<div class="invest-card">
+      <h3>无解</h3>
+      <ul class="reason-list">${r.reasons.map(x => `<li>${esc(x)}</li>`).join("")}</ul>
+    </div>`;
+  } else {
+    conclusion = `<div class="invest-card"><h3>${esc(r.status_text)}</h3>
+      <div class="hint">${esc(r.summary)}</div></div>`;
+  }
+
+  const explained = r.explained_positives.length
+    ? `<div class="invest-card"><h3>已由已知声明解释的阳性（不归咎缺声明原料）</h3>
+        ${r.explained_positives.map(x =>
+          `<div class="sol-line">${esc(x.finished_good_id)} ← 声明来源 ${x.declared_sources.map(esc).join("、") || "—"}</div>`
+        ).join("")}</div>`
+    : "";
+  const conflicts = r.conflicts.length
+    ? `<div class="invest-card"><h3>声明与抽检冲突（阴性不作排除证据）</h3>
+        ${r.conflicts.map(x => `<div class="sol-line"><span class="badge conflict">${esc(x.finished_good_id)}</span> ${esc(x.message)}</div>`).join("")}</div>`
+    : "";
+  const candidates = r.candidates.length
+    ? `<div class="invest-card"><h3>候选原料（缺声明叶子，共 ${r.candidates.length} 个 / 上限 ${r.limits.max_candidates}）</h3>
+        <table><thead><tr><th style="width:120px">原料号</th><th>出现在阳性成品</th>
+          <th style="width:100px">是否排除</th><th>说明</th></tr></thead><tbody>
+        ${r.candidates.map(c => `<tr>
+          <td><strong>${esc(c.material_id)}</strong></td>
+          <td>${c.in_positive_finished_goods.map(esc).join("、") || '<span class="muted">—</span>'}</td>
+          <td>${c.excluded ? '<span class="badge excluded">已排除</span>' : "可用"}</td>
+          <td class="hint">${esc(c.note)}</td></tr>`).join("")}
+        </tbody></table></div>`
+    : "";
+
+  out.innerHTML = `<div class="${staleCls}">
+    <div class="invest-card">
+      <h3>排查结论：<span class="status-badge ${r.status}">${esc(r.status_text)}</span>
+        <span class="muted" style="font-weight:normal;font-size:12px">过敏原“${esc(r.allergen)}”</span></h3>
+      <div>${esc(r.summary)}</div>
+      <div class="hint">分析版本 v${inv.analyzed_state_version} · 时间 ${esc(inv.created_at)} UTC · ${esc(r.note)}</div>
+    </div>
+    ${conclusion}
+    ${explained}
+    ${conflicts}
+    ${candidates}
+    <div class="invest-card"><h3>抽检判定明细（${r.sampling.length} 款 / 上限 ${r.limits.max_finished_goods}）</h3>
+      <table><thead><tr><th style="width:130px">成品号</th><th style="width:70px">抽检</th>
+        <th style="width:270px">判定</th><th>依据</th></tr></thead>
+        <tbody>${samplingRows}</tbody></table>
+    </div>
+  </div>`;
 }
 
 loadState().catch(e => {

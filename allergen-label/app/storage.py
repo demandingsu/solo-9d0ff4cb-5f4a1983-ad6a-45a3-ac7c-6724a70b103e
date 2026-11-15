@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS snapshots (
     item_count        INTEGER NOT NULL,
     submitted_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 抽检排查结果：记录分析时所依据的 state_version，便于页面判断是否过期
+CREATE TABLE IF NOT EXISTS investigations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    allergen      TEXT NOT NULL,
+    state_version INTEGER NOT NULL,
+    payload       TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -112,6 +121,10 @@ class Storage:
                     "FROM snapshots ORDER BY version DESC LIMIT 10"
                 )
             ]
+            last_investigation = conn.execute(
+                "SELECT id, allergen, state_version, payload, created_at "
+                "FROM investigations ORDER BY id DESC LIMIT 1"
+            ).fetchone()
             conn.commit()
         finally:
             conn.close()
@@ -121,6 +134,7 @@ class Storage:
             "edges": edges,
             "all_nodes": all_nodes,
             "snapshots": snapshots,
+            "last_investigation": dict(last_investigation) if last_investigation else None,
         }
 
     # ---------- 写 ----------
@@ -189,3 +203,34 @@ class Storage:
             finally:
                 conn.close()
         return len(flat)
+
+    def save_investigation(
+        self, allergen: str, state_version: int, payload: str
+    ) -> dict:
+        """追加一条排查结果（不修改声明/配方/版本号）。只保留最近 20 条。"""
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "INSERT INTO investigations(allergen, state_version, payload) "
+                    "VALUES (?, ?, ?)",
+                    (allergen, state_version, payload),
+                )
+                investigation_id = int(cursor.lastrowid)
+                conn.execute(
+                    "DELETE FROM investigations WHERE id <= "
+                    "(SELECT MAX(id) FROM investigations) - 20"
+                )
+                row = conn.execute(
+                    "SELECT id, allergen, state_version, payload, created_at "
+                    "FROM investigations WHERE id = ?",
+                    (investigation_id,),
+                ).fetchone()
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return dict(row)
