@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>食品厂过敏原标签核对系统</title>
+<style>
+  :root {
+    --blue: #1f6feb; --green: #1a7f37; --amber: #bf6900; --red: #c0392b;
+    --bg: #f4f6f9; --card: #ffffff; --line: #d8dee6; --text: #1f2733;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+         background:var(--bg); color:var(--text); }
+  header { background:#16324f; color:#fff; padding:16px 28px; }
+  header h1 { margin:0; font-size:20px; }
+  header p { margin:6px 0 0; font-size:13px; opacity:.8; }
+  main { max-width:1180px; margin:22px auto; padding:0 18px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .card h2 { margin:0 0 10px; font-size:15px; }
+  .upload-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input[type=file] { font-size:13px; max-width:220px; }
+  button { background:var(--blue); color:#fff; border:0; border-radius:6px; padding:8px 14px;
+           font-size:13px; cursor:pointer; }
+  button:hover { filter:brightness(1.08); }
+  button.secondary { background:#57606a; }
+  .hint { font-size:12px; color:#5b6572; margin-top:8px; line-height:1.6; }
+  .banner { margin-top:10px; padding:10px 12px; border-radius:6px; font-size:13px; display:none;
+            white-space:pre-wrap; line-height:1.6; }
+  .banner.ok { display:block; background:#e6f4ea; color:var(--green); border:1px solid #b7dfc4; }
+  .banner.err { display:block; background:#fdecea; color:var(--red); border:1px solid #f5c6c0; }
+  .statusbar { display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin:18px 0 10px;
+               font-size:13px; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; }
+  .badge.ok { background:#e6f4ea; color:var(--green); }
+  .badge.pending { background:#fff4e5; color:var(--amber); }
+  .ver { font-family:monospace; background:#eef1f5; padding:2px 8px; border-radius:6px; }
+  table { width:100%; border-collapse:collapse; background:var(--card);
+          border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  th, td { padding:10px 12px; border-bottom:1px solid var(--line); font-size:13px;
+           text-align:left; vertical-align:top; }
+  th { background:#eef1f5; font-weight:600; }
+  tr:last-child td { border-bottom:0; }
+  tr.pending-row { background:#fffaf2; }
+  .allergen-tag { display:inline-block; background:#eaf1fe; color:#1f4fb0; border-radius:5px;
+                  padding:1px 8px; margin:2px 4px 2px 0; font-size:12px; }
+  .muted { color:#7a8593; }
+  .missing-tag { color:var(--red); font-weight:600; }
+  .filters { display:flex; gap:8px; }
+  .filters button.active { outline:2px solid #16324f; }
+  details summary { cursor:pointer; color:var(--blue); font-size:12px; margin-top:4px; }
+  .src-line { font-size:12px; margin:2px 0; }
+  .snap { font-size:12px; color:#5b6572; }
+  .empty { padding:26px; text-align:center; color:#7a8593; }
+</style>
+</head>
+<body>
+<header>
+  <h1>食品厂过敏原标签核对系统</h1>
+  <p>上传原料声明与配方关系（整版替换），按每种原料最高修订推导每款成品应标注的过敏原及来源；缺声明标注“待核”，配方成环整份拒收。</p>
+</header>
+<main>
+  <section class="cards">
+    <div class="card">
+      <h2>① 原料声明 CSV</h2>
+      <div class="upload-row">
+        <input type="file" id="declFile" accept=".csv,text/csv">
+        <button onclick="upload('declarations')">上传并整版替换</button>
+      </div>
+      <div class="hint">列：原料号, 修订号, 过敏原（多种过敏原用逗号/顿号分隔；留空=该修订无过敏原）。<br>
+        同号同修订异内容将被拒收。</div>
+      <div id="declBanner" class="banner"></div>
+    </div>
+    <div class="card">
+      <h2>② 配方关系 CSV</h2>
+      <div class="upload-row">
+        <input type="file" id="relFile" accept=".csv,text/csv">
+        <button onclick="upload('relations')">上传并整版替换</button>
+      </div>
+      <div class="hint">列：父项, 子项（每行一条父子关系，支持半成品复用与嵌套）。<br>
+        检测到环将拒收整份文件，保留旧配方。</div>
+      <div id="relBanner" class="banner"></div>
+    </div>
+    <div class="card">
+      <h2>③ 当前已提交状态</h2>
+      <div id="statusbar" class="statusbar"><span class="muted">加载中…</span></div>
+      <div class="hint">页面中的配方、声明与标注保证来自同一已提交版本（state_version）。</div>
+    </div>
+  </section>
+
+  <section>
+    <div class="statusbar">
+      <strong>成品应标注过敏原</strong>
+      <div class="filters">
+        <button class="secondary active" data-filter="all" onclick="setFilter('all')">全部</button>
+        <button class="secondary" data-filter="pending" onclick="setFilter('pending')">仅待核</button>
+        <button class="secondary" data-filter="ok" onclick="setFilter('ok')">仅已确定</button>
+      </div>
+      <button class="secondary" onclick="loadState()">刷新</button>
+      <span class="snap" id="snapInfo"></span>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:150px">成品号</th><th style="width:90px">标注状态</th>
+        <th>应标注过敏原（含来源原料）</th><th style="width:260px">待核 / 修订依据</th>
+      </tr></thead>
+      <tbody id="resultBody"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <div class="statusbar">
+      <strong>同版本原料声明（取最高修订）</strong>
+      <span class="snap">与上表同为 v<span id="declVer"></span> 已提交状态</span>
+    </div>
+    <table>
+      <thead><tr><th style="width:150px">原料号</th><th style="width:160px">全部修订 → 选用</th>
+        <th>最高修订过敏原</th></tr></thead>
+      <tbody id="declBody"></tbody>
+    </table>
+  </section>
+
+  <section style="margin-top:18px">
+    <div class="statusbar">
+      <strong>同版本配方关系（父项 → 子项）</strong>
+      <span class="snap">与上两表同为 v<span id="relVer"></span> 已提交状态</span>
+    </div>
+    <table>
+      <thead><tr><th style="width:220px">父项</th><th>子项（按文件顺序）</th></tr></thead>
+      <tbody id="relBody"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+let currentFilter = "all";
+let lastVersion = null;
+
+function setFilter(f) {
+  currentFilter = f;
+  document.querySelectorAll(".filters button").forEach(b =>
+    b.classList.toggle("active", b.dataset.filter === f));
+  render();
+}
+
+function showBanner(id, kind, text) {
+  const el = document.getElementById(id);
+  el.className = "banner " + kind;
+  el.textContent = text;
+}
+
+async function upload(kind) {
+  const inputId = kind === "declarations" ? "declFile" : "relFile";
+  const bannerId = kind === "declarations" ? "declBanner" : "relBanner";
+  const input = document.getElementById(inputId);
+  if (!input.files.length) { showBanner(bannerId, "err", "请先选择 CSV 文件"); return; }
+  const fd = new FormData();
+  fd.append("file", input.files[0]);
+  showBanner(bannerId, "ok", "上传校验中…");
+  try {
+    const resp = await fetch("/api/" + kind, { method: "POST", body: fd });
+    const body = await resp.json();
+    if (!resp.ok) {
+      const detail = body.details && body.details.length ? "\n" + body.details.join("\n") : "";
+      showBanner(bannerId, "err", "✗ " + (body.error || body.detail || "上传失败") + detail);
+    } else {
+      showBanner(bannerId, "ok", "✓ " + body.message);
+      input.value = "";
+      await loadState();
+    }
+  } catch (e) {
+    showBanner(bannerId, "err", "✗ 网络错误：" + e);
+  }
+}
+
+let cached = null;
+async function loadState() {
+  const resp = await fetch("/api/state");
+  cached = await resp.json();
+  lastVersion = cached.state_version;
+  renderStatus();
+  render();
+}
+
+function renderStatus() {
+  const c = cached.counts;
+  document.getElementById("statusbar").innerHTML =
+    `<span>已提交版本：<span class="ver">v${cached.state_version}</span></span>` +
+    `<span>原料 ${c.materials} 种</span><span>关系 ${c.relations} 条</span>` +
+    `<span>成品 ${c.finished_goods} 款</span>` +
+    `<span class="${c.pending ? 'missing-tag' : ''}">待核 ${c.pending} 款</span>`;
+  const snaps = (cached.snapshots || []).slice(0, 3)
+    .map(s => `v${s.version} ${s.kind === "declarations" ? "声明" : "配方"} ${s.item_count}`)
+    .join("　");
+  document.getElementById("snapInfo").textContent = snaps ? "最近提交：" + snaps : "";
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, ch =>
+    ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[ch]));
+}
+
+function render() {
+  renderFinished();
+  renderDeclarations();
+  renderRelations();
+}
+
+function renderFinished() {
+  const body = document.getElementById("resultBody");
+  if (!cached) return;
+  let rows = cached.finished_goods;
+  if (currentFilter !== "all") rows = rows.filter(r => r.status === currentFilter);
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="4" class="empty">暂无数据：请先上传配方关系与原料声明 CSV</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map(r => {
+    const statusBadge = r.status === "pending"
+      ? `<span class="badge pending">待核</span>`
+      : `<span class="badge ok">已确定</span>`;
+    let allergenCell;
+    if (r.status === "pending") {
+      const tags = r.allergens.length
+        ? r.allergens.map(a => `<span class="allergen-tag">${esc(a)}</span>`).join("")
+        : `<span class="muted">暂无可确认过敏原</span>`;
+      allergenCell = tags +
+        `<div class="missing-tag">⚠ 存在缺声明原料，最终标签须待核，不得按无过敏原处理</div>` +
+        sourceDetails(r);
+    } else if (r.allergens.length) {
+      allergenCell = r.allergens.map(a => `<span class="allergen-tag">${esc(a)}</span>`).join("")
+        + sourceDetails(r);
+    } else {
+      allergenCell = `<span class="muted">无过敏原（全部原料声明均确认不含）</span>`;
+    }
+    const missing = r.missing_declarations.length
+      ? `<div class="missing-tag">缺声明：${r.missing_declarations.map(esc).join("、")}</div>` : "";
+    const revEntries = Object.entries(r.used_revisions)
+      .sort((a,b)=>a[0].localeCompare(b[0],"zh"))
+      .map(([m,rev]) => `${esc(m)}@rev${rev}`).join("，");
+    return `<tr class="${r.status === "pending" ? "pending-row" : ""}">
+      <td><strong>${esc(r.finished_good_id)}</strong></td>
+      <td>${statusBadge}</td>
+      <td>${allergenCell}</td>
+      <td>${missing}<div class="hint">选用修订：${revEntries || "—"}</div></td>
+    </tr>`;
+  }).join("");
+}
+
+function renderDeclarations() {
+  document.getElementById("declVer").textContent = cached.state_version;
+  const body = document.getElementById("declBody");
+  if (!cached.declarations.length) {
+    body.innerHTML = `<tr><td colspan="3" class="empty">尚未上传原料声明</td></tr>`;
+    return;
+  }
+  body.innerHTML = cached.declarations.map(d => {
+    const revs = d.revisions.map(r =>
+      r === d.highest_revision ? `<strong>rev${r}（选用）</strong>` : `rev${r}`).join("、");
+    const allergen = d.allergens.length
+      ? d.allergens.map(a => `<span class="allergen-tag">${esc(a)}</span>`).join("")
+      : `<span class="muted">确认无过敏原</span>`;
+    return `<tr><td><strong>${esc(d.material_id)}</strong></td><td>${revs}</td><td>${allergen}</td></tr>`;
+  }).join("");
+}
+
+function renderRelations() {
+  document.getElementById("relVer").textContent = cached.state_version;
+  const body = document.getElementById("relBody");
+  if (!cached.relations.length) {
+    body.innerHTML = `<tr><td colspan="2" class="empty">尚未上传配方关系</td></tr>`;
+    return;
+  }
+  const groups = {};
+  cached.relations.forEach(r => (groups[r.parent] ||= []).push(r.child));
+  body.innerHTML = Object.entries(groups).map(([p, kids]) =>
+    `<tr><td><strong>${esc(p)}</strong></td><td>${kids.map(esc).join("、")}</td></tr>`
+  ).join("");
+}
+
+function sourceDetails(r) {
+  const entries = Object.entries(r.sources);
+  if (!entries.length) return "";
+  const lines = entries.sort((a,b)=>a[0].localeCompare(b[0],"zh"))
+    .map(([a, srcs]) => `<div class="src-line">${esc(a)} ← ${srcs.map(esc).join("、")}</div>`)
+    .join("");
+  return `<details><summary>查看来源原料（${entries.length} 种过敏原）</summary>${lines}</details>`;
+}
+
+loadState().catch(e => {
+  document.getElementById("statusbar").textContent = "加载失败：" + e;
+});
+// 并发场景下每 5 秒拉取一次；整页数据始终按返回的同一版本渲染
+setInterval(() => loadState().catch(() => {}), 5000);
+</script>
+</body>
+</html>
